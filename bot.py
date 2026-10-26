@@ -7,12 +7,11 @@ import subprocess
 from pathlib import Path
 
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -21,6 +20,17 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MAX_UPLOAD = 45 * 1024 * 1024
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+
+VIDEO_BUTTON = "🎬 تنزيل فيديو"
+AUDIO_BUTTON = "🎵 تنزيل MP3"
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(VIDEO_BUTTON), KeyboardButton(AUDIO_BUTTON)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="اختر نوع التنزيل أو أرسل الرابط...",
+)
 
 
 def download_media(url, kind, folder):
@@ -61,7 +71,8 @@ def download_media(url, kind, folder):
 
     files = [
         p for p in Path(folder).iterdir()
-        if p.is_file() and p.name.startswith("media.")
+        if p.is_file()
+        and p.name.startswith("media.")
         and not p.name.endswith(".part")
     ]
     if not files:
@@ -120,49 +131,56 @@ def prepare_file(media, folder, kind):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton("🎬 تنزيل فيديو", callback_data="video"),
-            InlineKeyboardButton("🎵 استخراج MP3", callback_data="audio"),
-        ]
-    ]
-    await update.message.reply_text(
-        "أهلًا بك! اختر ما تريد تنزيله، ثم أرسل رابط المنشور أو الفيديو.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    # Keep video as the default mode for a new chat.
+    context.user_data.setdefault("kind", "video")
+    await update.effective_message.reply_text(
+        "أهلًا بك! 👋\n\n"
+        "اختر من الأزرار أسفل المحادثة:\n"
+        "🎬 تنزيل فيديو\n"
+        "🎵 تنزيل MP3\n\n"
+        "بعد اختيار الوضع، أرسل رابط الفيديو أو المنشور. "
+        "سيبقى الوضع المختار فعالًا حتى تغيّره.",
+        reply_markup=MAIN_KEYBOARD,
     )
-
-
-async def choose_format(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["kind"] = query.data
-
-    if query.data == "audio":
-        message = "🎵 أرسل رابط الفيديو الذي تريد استخراج الصوت منه بصيغة MP3."
-    else:
-        message = "🎬 أرسل رابط الفيديو الذي تريد تنزيله."
-
-    await query.message.reply_text(message)
 
 
 async def handle_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    text = update.message.text or ""
-    match = URL_PATTERN.search(text)
+    message = update.effective_message
+    text = (message.text or "").strip()
 
+    # Handle persistent keyboard button presses before searching for a URL.
+    if text == VIDEO_BUTTON:
+        context.user_data["kind"] = "video"
+        await message.reply_text(
+            "🎬 تم اختيار تنزيل الفيديو.\nأرسل رابط الفيديو أو المنشور.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if text == AUDIO_BUTTON:
+        context.user_data["kind"] = "audio"
+        await message.reply_text(
+            "🎵 تم اختيار استخراج MP3.\nأرسل رابط الفيديو الذي تريد استخراج صوته.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    match = URL_PATTERN.search(text)
     if not match:
-        await update.message.reply_text(
-            "أرسل رابطًا يبدأ بـ https:// أو http://"
+        await message.reply_text(
+            "أرسل رابطًا يبدأ بـ https:// أو http://، "
+            "أو اختر نوع التنزيل من الأزرار أسفل المحادثة.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     url = match.group(0).rstrip(".,;!?)\u005d}")
     kind = context.user_data.get("kind", "video")
-    status = await update.message.reply_text(
-        "⏳ بدأت عملية التنزيل. قد يستغرق إنستغرام بعض الوقت..."
+    status = await message.reply_text(
+        "⏳ بدأت عملية التنزيل. قد يستغرق إنستغرام بعض الوقت...",
+        reply_markup=MAIN_KEYBOARD,
     )
 
     try:
@@ -192,7 +210,7 @@ async def handle_link(
             upload_started = time.monotonic()
             with media.open("rb") as file:
                 if kind == "audio":
-                    await update.message.reply_audio(
+                    await message.reply_audio(
                         audio=file,
                         filename=media.name,
                         read_timeout=600,
@@ -201,7 +219,7 @@ async def handle_link(
                         pool_timeout=60,
                     )
                 else:
-                    await update.message.reply_video(
+                    await message.reply_video(
                         video=file,
                         filename=media.name,
                         supports_streaming=True,
@@ -231,7 +249,7 @@ async def handle_link(
                 "❌ لم تكتمل العملية.\n\n"
                 f"السبب: {error}\n\n"
                 "قد يكون الرابط خاصًا، أو يتطلب تسجيل الدخول، "
-                "أو أن إنستغرام يقيّد الطلبات، أو أن الاتصال بتيليجرام انقطع."
+                "أو أن المنصة تقيّد الطلبات، أو أن الاتصال بتيليجرام انقطع."
             )
         except Exception as status_error:
             print(
@@ -267,7 +285,6 @@ def main():
 
     app = Application.builder().token(TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(choose_format))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
     )
