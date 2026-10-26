@@ -1,25 +1,38 @@
 import os
 import re
+import sys
 import time
+import pickle
 import asyncio
 import tempfile
 import subprocess
 from pathlib import Path
 
+import telegram
 import yt_dlp
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.error import Conflict
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    PicklePersistence,
+    PersistenceInput,
     filters,
 )
+
+BOT_VERSION = "kbd-2026-10-26"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MAX_UPLOAD = 45 * 1024 * 1024
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.pickle")
+
+# أقصى عدد تنزيلات متزامنة (حتى لا تتعب الاستضافة)
+DOWNLOAD_SLOTS = asyncio.Semaphore(2)
 
 VIDEO_BUTTON = "🎬 تنزيل فيديو"
 AUDIO_BUTTON = "🎵 تنزيل MP3"
@@ -31,6 +44,34 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
     input_field_placeholder="اختر نوع التنزيل أو أرسل الرابط...",
 )
+
+
+def log(message):
+    print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+def mode_title(kind):
+    return "🎵 MP3" if kind == "audio" else "🎬 فيديو"
+
+
+def clean_error(exc):
+    text = str(exc) or exc.__class__.__name__
+    text = ANSI_RE.sub("", text)
+    if TOKEN:
+        text = text.replace(TOKEN, "[hidden token]")
+    return text[:700]
+
+
+def detect_mode_button(text):
+    """يرجع video أو audio إذا كانت الرسالة ضغطة على أحد الزرين."""
+    t = text.strip()
+    if len(t) > 40:
+        return None
+    if t == VIDEO_BUTTON or "تنزيل فيديو" in t:
+        return "video"
+    if t == AUDIO_BUTTON or "تنزيل MP3" in t or "mp3" in t.lower():
+        return "audio"
+    return None
 
 
 def download_media(url, kind, folder):
@@ -85,7 +126,7 @@ def prepare_file(media, folder, kind):
     if media.stat().st_size <= MAX_UPLOAD:
         return media
 
-    print("STATS: file is large; compressing...", flush=True)
+    log("STATS: file is large; compressing...")
     output = str(Path(folder) / (
         "compressed.mp4" if kind == "video" else "compressed.mp3"
     ))
@@ -107,12 +148,18 @@ def prepare_file(media, folder, kind):
             output
         ]
 
-    subprocess.run(
-        command,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("برنامج ffmpeg غير مثبت على الاستضافة.") from None
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or b"").decode("utf-8", "ignore")[-300:]
+        raise RuntimeError(f"فشل ضغط الملف: {tail}") from None
 
     result = Path(output)
     if not result.exists():
@@ -123,23 +170,25 @@ def prepare_file(media, folder, kind):
             "جرّب فيديو أقصر."
         )
 
-    print(
-        f"STATS: compressed_size={result.stat().st_size} bytes",
-        flush=True,
-    )
+    log(f"STATS: compressed_size={result.stat().st_size} bytes")
     return result
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Keep video as the default mode for a new chat.
-    context.user_data.setdefault("kind", "video")
+    # الفيديو هو الوضع الافتراضي لأي محادثة جديدة
+    kind = context.user_data.setdefault("kind", "video")
+    chat = update.effective_chat
+    log(f"START: chat={chat.id if chat else '?'} mode={kind}")
+
     await update.effective_message.reply_text(
         "أهلًا بك! 👋\n\n"
         "اختر من الأزرار أسفل المحادثة:\n"
         "🎬 تنزيل فيديو\n"
         "🎵 تنزيل MP3\n\n"
         "بعد اختيار الوضع، أرسل رابط الفيديو أو المنشور. "
-        "سيبقى الوضع المختار فعالًا حتى تغيّره.",
+        "سيبقى الوضع المختار فعالًا حتى تغيّره.\n\n"
+        f"الوضع الحالي: {mode_title(kind)}\n"
+        f"🔖 نسخة البوت: {BOT_VERSION}",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -148,27 +197,35 @@ async def handle_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     message = update.effective_message
-    text = (message.text or "").strip()
-
-    # Handle persistent keyboard button presses before searching for a URL.
-    if text == VIDEO_BUTTON:
-        context.user_data["kind"] = "video"
-        await message.reply_text(
-            "🎬 تم اختيار تنزيل الفيديو.\nأرسل رابط الفيديو أو المنشور.",
-            reply_markup=MAIN_KEYBOARD,
-        )
+    if message is None or not message.text:
         return
 
-    if text == AUDIO_BUTTON:
-        context.user_data["kind"] = "audio"
-        await message.reply_text(
-            "🎵 تم اختيار استخراج MP3.\nأرسل رابط الفيديو الذي تريد استخراج صوته.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
+    text = message.text.strip()
+    chat = update.effective_chat
+    chat_id = chat.id if chat else "?"
 
     match = URL_PATTERN.search(text)
+
+    # ضغطة على أحد زرّي الكيبورد (قبل البحث عن رابط)
     if not match:
+        chosen = detect_mode_button(text)
+        if chosen:
+            context.user_data["kind"] = chosen
+            log(f"MODE: chat={chat_id} mode={chosen}")
+            if chosen == "video":
+                await message.reply_text(
+                    "🎬 تم اختيار تنزيل الفيديو.\n"
+                    "أرسل رابط الفيديو أو المنشور.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            else:
+                await message.reply_text(
+                    "🎵 تم اختيار استخراج MP3.\n"
+                    "أرسل رابط الفيديو الذي تريد استخراج صوته.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            return
+
         await message.reply_text(
             "أرسل رابطًا يبدأ بـ https:// أو http://، "
             "أو اختر نوع التنزيل من الأزرار أسفل المحادثة.",
@@ -176,99 +233,154 @@ async def handle_link(
         )
         return
 
-    url = match.group(0).rstrip(".,;!?)\u005d}")
+    url = match.group(0).rstrip(".,;!?)]}")
     kind = context.user_data.get("kind", "video")
+    log(f"JOB: chat={chat_id} mode={kind}")
+
     status = await message.reply_text(
         "⏳ بدأت عملية التنزيل. قد يستغرق إنستغرام بعض الوقت...",
         reply_markup=MAIN_KEYBOARD,
     )
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="media_bot_") as folder:
-            started = time.monotonic()
-            media = await asyncio.to_thread(
-                download_media, url, kind, folder
-            )
-            download_seconds = time.monotonic() - started
-
-            print(
-                f"STATS: download={download_seconds:.1f}s "
-                f"size={media.stat().st_size} bytes",
-                flush=True,
-            )
-
-            await status.edit_text(
-                "✅ اكتمل التنزيل.\n"
-                f"⏱️ وقت التنزيل: {download_seconds:.1f} ثانية\n"
-                "📤 أجهّز الملف للإرسال إلى تيليجرام..."
-            )
-
-            media = await asyncio.to_thread(
-                prepare_file, media, folder, kind
-            )
-
-            upload_started = time.monotonic()
-            with media.open("rb") as file:
-                if kind == "audio":
-                    await message.reply_audio(
-                        audio=file,
-                        filename=media.name,
-                        read_timeout=600,
-                        write_timeout=600,
-                        connect_timeout=60,
-                        pool_timeout=60,
-                    )
-                else:
-                    await message.reply_video(
-                        video=file,
-                        filename=media.name,
-                        supports_streaming=True,
-                        read_timeout=600,
-                        write_timeout=600,
-                        connect_timeout=60,
-                        pool_timeout=60,
-                    )
-
-            upload_seconds = time.monotonic() - upload_started
-            print(
-                f"STATS: upload={upload_seconds:.1f}s",
-                flush=True,
-            )
-            await status.edit_text(
-                "✅ تم إرسال الملف بنجاح!\n"
-                f"⏬ وقت التنزيل: {download_seconds:.1f} ثانية\n"
-                f"📤 وقت الإرسال: {upload_seconds:.1f} ثانية"
-            )
-
-    except Exception as exc:
-        error = str(exc).replace(TOKEN or "", "[hidden token]")
-        error = error[:700]
-        print(f"ERROR: {error}", flush=True)
+    async with DOWNLOAD_SLOTS:
         try:
-            await status.edit_text(
-                "❌ لم تكتمل العملية.\n\n"
-                f"السبب: {error}\n\n"
-                "قد يكون الرابط خاصًا، أو يتطلب تسجيل الدخول، "
-                "أو أن المنصة تقيّد الطلبات، أو أن الاتصال بتيليجرام انقطع."
-            )
-        except Exception as status_error:
-            print(
-                f"STATUS_ERROR: {status_error.__class__.__name__}",
-                flush=True,
-            )
+            with tempfile.TemporaryDirectory(prefix="media_bot_") as folder:
+                started = time.monotonic()
+                media = await asyncio.to_thread(
+                    download_media, url, kind, folder
+                )
+                download_seconds = time.monotonic() - started
+
+                log(
+                    f"STATS: download={download_seconds:.1f}s "
+                    f"size={media.stat().st_size} bytes"
+                )
+
+                try:
+                    await status.edit_text(
+                        "✅ اكتمل التنزيل.\n"
+                        f"⏱️ وقت التنزيل: {download_seconds:.1f} ثانية\n"
+                        "📤 أجهّز الملف للإرسال إلى تيليجرام..."
+                    )
+                except Exception as edit_error:
+                    log(f"STATUS_ERROR: {edit_error.__class__.__name__}")
+
+                media = await asyncio.to_thread(
+                    prepare_file, media, folder, kind
+                )
+
+                upload_started = time.monotonic()
+                with media.open("rb") as file:
+                    if kind == "audio":
+                        await message.reply_audio(
+                            audio=file,
+                            filename=media.name,
+                            reply_markup=MAIN_KEYBOARD,
+                            read_timeout=600,
+                            write_timeout=600,
+                            connect_timeout=60,
+                            pool_timeout=60,
+                        )
+                    else:
+                        await message.reply_video(
+                            video=file,
+                            filename=media.name,
+                            supports_streaming=True,
+                            reply_markup=MAIN_KEYBOARD,
+                            read_timeout=600,
+                            write_timeout=600,
+                            connect_timeout=60,
+                            pool_timeout=60,
+                        )
+
+                upload_seconds = time.monotonic() - upload_started
+                log(f"STATS: upload={upload_seconds:.1f}s")
+
+            try:
+                await status.edit_text(
+                    "✅ تم إرسال الملف بنجاح!\n"
+                    f"⏬ وقت التنزيل: {download_seconds:.1f} ثانية\n"
+                    f"📤 وقت الإرسال: {upload_seconds:.1f} ثانية"
+                )
+            except Exception as edit_error:
+                log(f"STATUS_ERROR: {edit_error.__class__.__name__}")
+
+        except Exception as exc:
+            error = clean_error(exc)
+            log(f"ERROR: mode={kind} {error}")
+
+            # التعديل على رسالة قديمة ما بيحمل لوحة الأزرار،
+            # فنحذف رسالة الحالة ونرسل الخطأ كرسالة جديدة مع الأزرار.
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+            try:
+                await message.reply_text(
+                    "❌ لم تكتمل العملية.\n\n"
+                    f"السبب: {error}\n\n"
+                    "قد يكون الرابط خاصًا، أو يتطلب تسجيل الدخول، "
+                    "أو أن المنصة تقيّد الطلبات، أو أن الاتصال بتيليجرام انقطع.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            except Exception as reply_error:
+                log(f"REPLY_ERROR: {reply_error.__class__.__name__}")
 
 
 async def error_handler(
     update: object, context: ContextTypes.DEFAULT_TYPE
 ):
     error = context.error
-    print(
-        f"BOT_ERROR: {type(error).__name__}: {error}",
-        flush=True,
-    )
+    if isinstance(error, Conflict):
+        log(
+            "CONFLICT: في نسخة ثانية من البوت شغالة بنفس التوكن. "
+            "أوقف النسخة الأخرى (استضافة قديمة أو جهاز ثاني)."
+        )
+        return
+    log(f"BOT_ERROR: {type(error).__name__}: {error}")
+
+
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    log(f"BOT_USERNAME=@{me.username}")
+    log(f"READY: version={BOT_VERSION}")
+
+
+def build_persistence():
+    """حفظ الوضع المختار بملف حتى يبقى بعد إعادة التشغيل."""
+    path = Path(STATE_FILE)
+    try:
+        if path.exists():
+            with path.open("rb") as f:
+                pickle.load(f)
+        persistence = PicklePersistence(
+            filepath=str(path),
+            store_data=PersistenceInput(
+                bot_data=False,
+                chat_data=False,
+                callback_data=False,
+            ),
+        )
+        log(f"STATE: saving mode to {path}")
+        return persistence
+    except Exception as exc:
+        log(f"STATE: persistence disabled ({type(exc).__name__})")
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return None
 
 
 def main():
+    log(
+        f"BOOT: version={BOT_VERSION} "
+        f"python={sys.version.split()[0]} "
+        f"ptb={telegram.__version__}"
+    )
+
     if not TOKEN:
         raise RuntimeError(
             "متغير TELEGRAM_BOT_TOKEN غير موجود. "
@@ -283,15 +395,27 @@ def main():
         pool_timeout=60,
     )
 
-    app = Application.builder().token(TOKEN).request(request).build()
+    builder = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .concurrent_updates(8)
+        .post_init(post_init)
+    )
+
+    persistence = build_persistence()
+    if persistence is not None:
+        builder = builder.persistence(persistence)
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
     )
     app.add_error_handler(error_handler)
 
-    print("البوت يعمل. أوقفه باستخدام Ctrl+C.", flush=True)
-    app.run_polling()
+    log("البوت يعمل. أوقفه باستخدام Ctrl+C.")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
