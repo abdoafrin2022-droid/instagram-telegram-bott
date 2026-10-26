@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import time
 import pickle
 import asyncio
@@ -24,14 +25,15 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "kbd-2026-10-26b"
+BOT_VERSION = "final-2026-10-26"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OWNER_ID = os.getenv("OWNER_ID", "").strip()  # رقم حسابك على تيليجرام (اختياري)
 MAX_UPLOAD = 45 * 1024 * 1024
-MAX_YT_AUDIO_SECONDS = 15 * 60  # أقصى مدة لاستخراج MP3 من يوتيوب (15 دقيقة)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.pickle")
+STATS_PATH = Path(os.getenv("BOT_USERS_FILE", "bot_users.json"))
 
 # أقصى عدد تنزيلات متزامنة (حتى لا تتعب الاستضافة)
 DOWNLOAD_SLOTS = asyncio.Semaphore(2)
@@ -48,15 +50,101 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 SUPPORT_TEXT = (
-    "✅ إنستغرام وفيسبوك: تنزيل فيديو أو MP3\n"
-    "🎵 يوتيوب: MP3 فقط (للأغاني والمقاطع حتى "
-    f"{MAX_YT_AUDIO_SECONDS // 60} دقيقة)"
+    "✅ المدعوم: إنستغرام وفيسبوك (فيديو أو MP3)\n"
+    "🚫 يوتيوب غير مدعوم حاليًا"
 )
+
+# ---------------------------------------------------------------
+# تخزين المشتركين (أرقام الحسابات فقط، بدون روابط ولا رسائل)
+# ---------------------------------------------------------------
+
+DATA = {"users": {}, "video": 0, "audio": 0}
 
 
 def log(message):
     print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
 
+
+def day_string(days_ago=0):
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() - days_ago * 86400))
+
+
+def load_data():
+    global DATA
+    try:
+        if STATS_PATH.exists():
+            with STATS_PATH.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict) and isinstance(loaded.get("users"), dict):
+                DATA = {
+                    "users": loaded["users"],
+                    "video": int(loaded.get("video", 0)),
+                    "audio": int(loaded.get("audio", 0)),
+                }
+        log(f"USERS_FILE: users={len(DATA['users'])} path={STATS_PATH}")
+    except Exception as exc:
+        log(f"USERS_FILE: could not read ({type(exc).__name__}); starting fresh")
+
+
+def save_data():
+    try:
+        tmp = STATS_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(DATA, f, ensure_ascii=False)
+        os.replace(tmp, STATS_PATH)
+    except Exception as exc:
+        log(f"USERS_FILE: could not save ({type(exc).__name__})")
+
+
+def track_user(update):
+    """يسجّل المستخدم. يرجع True إذا كان جديدًا."""
+    user = update.effective_user
+    if user is None or user.is_bot:
+        return False
+    uid = str(user.id)
+    today = day_string()
+    entry = DATA["users"].get(uid)
+    if entry is None:
+        DATA["users"][uid] = {"f": today, "l": today}
+        save_data()
+        return True
+    if entry.get("l") != today:
+        entry["l"] = today
+        save_data()
+    return False
+
+
+def count_job(kind):
+    key = "audio" if kind == "audio" else "video"
+    DATA[key] = int(DATA.get(key, 0)) + 1
+    save_data()
+
+
+def is_owner(update):
+    user = update.effective_user
+    return bool(user) and OWNER_ID.isdigit() and str(user.id) == OWNER_ID
+
+
+async def register_user(update, context):
+    """يسجّل المستخدم وينبّه المالك إذا كان جديدًا."""
+    is_new = track_user(update)
+    if is_new:
+        total = len(DATA["users"])
+        log(f"NEW_USER: total={total}")
+        if OWNER_ID.isdigit() and not is_owner(update):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(OWNER_ID),
+                    text=f"👤 مشترك جديد! الإجمالي الآن: {total}",
+                )
+            except Exception as exc:
+                log(f"NOTIFY_ERROR: {exc.__class__.__name__}")
+    return is_new
+
+
+# ---------------------------------------------------------------
+# أدوات عامة
+# ---------------------------------------------------------------
 
 def mode_title(kind):
     return "🎵 MP3" if kind == "audio" else "🎬 فيديو"
@@ -70,33 +158,15 @@ def clean_error(exc):
     return text[:700]
 
 
-def friendly_error(exc):
-    raw = clean_error(exc)
-    low = raw.lower()
-    if "sign in to confirm" in low or "not a bot" in low:
-        return (
-            "يوتيوب رفض الطلب من سيرفر البوت (حماية ضد البوتات). "
-            "جرّب رابطًا ثانيًا أو أعد المحاولة لاحقًا."
-        )
-    return raw
-
-
-def youtube_kind(url):
-    """يرجع None إذا ليس يوتيوب، أو video، أو playlist."""
+def is_youtube(url):
     try:
-        parsed = urlparse(url)
+        host = (urlparse(url).hostname or "").lower()
     except ValueError:
-        return None
-    host = (parsed.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if host == "youtu.be":
-        return "video"
-    if host in ("youtube.com", "m.youtube.com", "music.youtube.com"):
-        if parsed.path.startswith("/playlist"):
-            return "playlist"
-        return "video"
-    return None
+        return False
+    return (
+        host in ("youtu.be", "youtube.com", "youtube-nocookie.com")
+        or host.endswith(".youtube.com")
+    )
 
 
 def detect_mode_button(text):
@@ -111,9 +181,12 @@ def detect_mode_button(text):
     return None
 
 
-def download_media(url, kind, folder, is_youtube=False):
+# ---------------------------------------------------------------
+# التنزيل وتجهيز الملف
+# ---------------------------------------------------------------
+
+def download_media(url, kind, folder):
     output = str(Path(folder) / "media.%(ext)s")
-    skipped = {}
     options = {
         "outtmpl": output,
         "noplaylist": True,
@@ -135,18 +208,6 @@ def download_media(url, kind, folder, is_youtube=False):
                 "preferredquality": "128",
             }],
         })
-        if is_youtube:
-            def duration_filter(info, *args, **kwargs):
-                duration = info.get("duration")
-                if duration and duration > MAX_YT_AUDIO_SECONDS:
-                    skipped["reason"] = (
-                        "الفيديو أطول من الحد المسموح لاستخراج MP3 من يوتيوب "
-                        f"({MAX_YT_AUDIO_SECONDS // 60} دقيقة)."
-                    )
-                    return "too long"
-                return None
-
-            options["match_filter"] = duration_filter
     else:
         options.update({
             "format": (
@@ -167,8 +228,6 @@ def download_media(url, kind, folder, is_youtube=False):
         and not p.name.endswith(".part")
     ]
     if not files:
-        if skipped:
-            raise RuntimeError(skipped["reason"])
         raise RuntimeError("لم يُعثر على الملف بعد التنزيل.")
 
     return max(files, key=lambda p: p.stat().st_size)
@@ -226,22 +285,98 @@ def prepare_file(media, folder, kind):
     return result
 
 
+# ---------------------------------------------------------------
+# الأوامر
+# ---------------------------------------------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_new = await register_user(update, context)
+
     # الفيديو هو الوضع الافتراضي لأي محادثة جديدة
     kind = context.user_data.setdefault("kind", "video")
     chat = update.effective_chat
-    log(f"START: chat={chat.id if chat else '?'} mode={kind}")
+    log(f"START: chat={chat.id if chat else '?'} mode={kind} new={is_new}")
+
+    if is_new:
+        user = update.effective_user
+        name = (user.first_name or "").strip()[:30] if user else ""
+        greeting = f"أهلًا وسهلًا {name}! 🎉" if name else "أهلًا وسهلًا! 🎉"
+        text = (
+            f"{greeting}\n"
+            "يسعدنا انضمامك إلى بوت التنزيل 🤍\n\n"
+            "أقدر أساعدك في تنزيل:\n"
+            "📸 فيديوهات إنستغرام\n"
+            "📘 فيديوهات فيسبوك\n"
+            "🎵 أو استخراج الصوت MP3 منها\n\n"
+            "طريقة الاستخدام:\n"
+            "1️⃣ اختر 🎬 فيديو أو 🎵 MP3 من الأزرار أسفل المحادثة\n"
+            "2️⃣ أرسل رابط الفيديو\n"
+            "3️⃣ انتظر قليلًا وسيصلك الملف\n\n"
+            "سيبقى الوضع الذي اخترته فعالًا حتى تغيّره.\n\n"
+            f"{SUPPORT_TEXT}\n\n"
+            f"الوضع الحالي: {mode_title(kind)}"
+        )
+    else:
+        text = (
+            "أهلًا بعودتك! 👋\n\n"
+            "اختر من الأزرار أسفل المحادثة ثم أرسل الرابط.\n\n"
+            f"{SUPPORT_TEXT}\n\n"
+            f"الوضع الحالي: {mode_title(kind)}\n"
+            f"🔖 نسخة البوت: {BOT_VERSION}"
+        )
 
     await update.effective_message.reply_text(
-        "أهلًا بك! 👋\n\n"
-        "اختر من الأزرار أسفل المحادثة:\n"
-        "🎬 تنزيل فيديو\n"
-        "🎵 تنزيل MP3\n\n"
-        f"{SUPPORT_TEXT}\n\n"
-        "بعد اختيار الوضع، أرسل الرابط. "
-        "سيبقى الوضع المختار فعالًا حتى تغيّره.\n\n"
-        f"الوضع الحالي: {mode_title(kind)}\n"
-        f"🔖 نسخة البوت: {BOT_VERSION}",
+        text,
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None:
+        return
+    await update.effective_message.reply_text(
+        f"رقم حسابك على تيليجرام:\n{user.id}",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+
+    if not OWNER_ID.isdigit():
+        await message.reply_text(
+            "لم يتم تحديد مالك البوت بعد.\n"
+            "أرسل /myid ثم ضع رقمك في متغير OWNER_ID بالاستضافة.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if not is_owner(update):
+        await message.reply_text(
+            "هذا الأمر لمالك البوت فقط.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    users = DATA["users"]
+    today = day_string()
+    week_start = day_string(6)
+
+    total = len(users)
+    new_today = sum(1 for u in users.values() if u.get("f") == today)
+    active_today = sum(1 for u in users.values() if u.get("l") == today)
+    active_week = sum(1 for u in users.values() if str(u.get("l", "")) >= week_start)
+
+    await message.reply_text(
+        "📊 إحصائيات البوت\n\n"
+        f"👥 إجمالي المشتركين: {total}\n"
+        f"🆕 جدد اليوم: {new_today}\n"
+        f"🟢 نشطون اليوم: {active_today}\n"
+        f"📅 نشطون آخر 7 أيام: {active_week}\n\n"
+        f"🎬 فيديوهات أُرسلت: {DATA.get('video', 0)}\n"
+        f"🎵 ملفات MP3 أُرسلت: {DATA.get('audio', 0)}\n\n"
+        "المشترك = كل من فتح البوت. التواريخ بتوقيت UTC.",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -252,6 +387,8 @@ async def handle_link(
     message = update.effective_message
     if message is None or not message.text:
         return
+
+    await register_user(update, context)
 
     text = message.text.strip()
     chat = update.effective_chat
@@ -268,15 +405,13 @@ async def handle_link(
             if chosen == "video":
                 await message.reply_text(
                     "🎬 تم اختيار تنزيل الفيديو.\n"
-                    "أرسل رابط فيديو من إنستغرام أو فيسبوك.\n"
-                    "(يوتيوب متاح في وضع MP3 فقط.)",
+                    "أرسل رابط فيديو من إنستغرام أو فيسبوك.",
                     reply_markup=MAIN_KEYBOARD,
                 )
             else:
                 await message.reply_text(
                     "🎵 تم اختيار استخراج MP3.\n"
-                    "أرسل رابط الفيديو الذي تريد استخراج صوته "
-                    "(إنستغرام أو فيسبوك أو يوتيوب).",
+                    "أرسل رابط فيديو من إنستغرام أو فيسبوك لاستخراج صوته.",
                     reply_markup=MAIN_KEYBOARD,
                 )
             return
@@ -291,23 +426,12 @@ async def handle_link(
 
     url = match.group(0).rstrip(".,;!?)]}")
     kind = context.user_data.get("kind", "video")
-    yt = youtube_kind(url)
-    log(f"JOB: chat={chat_id} mode={kind} youtube={yt or 'no'}")
+    log(f"JOB: chat={chat_id} mode={kind}")
 
-    # قواعد يوتيوب: MP3 فقط، وبدون قوائم تشغيل
-    if yt == "playlist":
+    if is_youtube(url):
         await message.reply_text(
-            "قوائم تشغيل يوتيوب غير مدعومة.\n"
-            "أرسل رابط أغنية أو مقطع واحد.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    if yt and kind != "audio":
-        await message.reply_text(
-            "🚫 تنزيل فيديوهات يوتيوب غير متاح.\n\n"
-            "يوتيوب مدعوم لاستخراج الصوت فقط. "
-            "اضغط زر 🎵 تنزيل MP3 ثم أعد إرسال الرابط.",
+            "🚫 روابط يوتيوب غير مدعومة حاليًا.\n\n"
+            "المدعوم: إنستغرام وفيسبوك (فيديو أو MP3).",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -322,7 +446,7 @@ async def handle_link(
             with tempfile.TemporaryDirectory(prefix="media_bot_") as folder:
                 started = time.monotonic()
                 media = await asyncio.to_thread(
-                    download_media, url, kind, folder, bool(yt)
+                    download_media, url, kind, folder
                 )
                 download_seconds = time.monotonic() - started
 
@@ -370,6 +494,7 @@ async def handle_link(
 
                 upload_seconds = time.monotonic() - upload_started
                 log(f"STATS: upload={upload_seconds:.1f}s")
+                count_job(kind)
 
             try:
                 await status.edit_text(
@@ -381,8 +506,8 @@ async def handle_link(
                 log(f"STATUS_ERROR: {edit_error.__class__.__name__}")
 
         except Exception as exc:
-            log(f"ERROR: mode={kind} {clean_error(exc)}")
-            error = friendly_error(exc)
+            error = clean_error(exc)
+            log(f"ERROR: mode={kind} {error}")
 
             # التعديل على رسالة قديمة ما بيحمل لوحة الأزرار،
             # فنحذف رسالة الحالة ونرسل الخطأ كرسالة جديدة مع الأزرار.
@@ -419,6 +544,7 @@ async def error_handler(
 async def post_init(app: Application):
     me = await app.bot.get_me()
     log(f"BOT_USERNAME=@{me.username}")
+    log(f"OWNER_ID: {'set' if OWNER_ID.isdigit() else 'NOT SET'}")
     log(f"READY: version={BOT_VERSION}")
 
 
@@ -462,6 +588,8 @@ def main():
             "لم يتم تغيير التوكن أو طباعته."
         )
 
+    load_data()
+
     request = HTTPXRequest(
         connection_pool_size=16,
         connect_timeout=60,
@@ -484,6 +612,8 @@ def main():
 
     app = builder.build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", my_id))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
     )
