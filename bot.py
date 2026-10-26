@@ -7,6 +7,7 @@ import asyncio
 import tempfile
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 import telegram
 import yt_dlp
@@ -23,10 +24,11 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "kbd-2026-10-26"
+BOT_VERSION = "kbd-2026-10-26b"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MAX_UPLOAD = 45 * 1024 * 1024
+MAX_YT_AUDIO_SECONDS = 15 * 60  # أقصى مدة لاستخراج MP3 من يوتيوب (15 دقيقة)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 STATE_FILE = os.getenv("BOT_STATE_FILE", "bot_state.pickle")
@@ -43,6 +45,12 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
     input_field_placeholder="اختر نوع التنزيل أو أرسل الرابط...",
+)
+
+SUPPORT_TEXT = (
+    "✅ إنستغرام وفيسبوك: تنزيل فيديو أو MP3\n"
+    "🎵 يوتيوب: MP3 فقط (للأغاني والمقاطع حتى "
+    f"{MAX_YT_AUDIO_SECONDS // 60} دقيقة)"
 )
 
 
@@ -62,6 +70,35 @@ def clean_error(exc):
     return text[:700]
 
 
+def friendly_error(exc):
+    raw = clean_error(exc)
+    low = raw.lower()
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "يوتيوب رفض الطلب من سيرفر البوت (حماية ضد البوتات). "
+            "جرّب رابطًا ثانيًا أو أعد المحاولة لاحقًا."
+        )
+    return raw
+
+
+def youtube_kind(url):
+    """يرجع None إذا ليس يوتيوب، أو video، أو playlist."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "youtu.be":
+        return "video"
+    if host in ("youtube.com", "m.youtube.com", "music.youtube.com"):
+        if parsed.path.startswith("/playlist"):
+            return "playlist"
+        return "video"
+    return None
+
+
 def detect_mode_button(text):
     """يرجع video أو audio إذا كانت الرسالة ضغطة على أحد الزرين."""
     t = text.strip()
@@ -74,8 +111,9 @@ def detect_mode_button(text):
     return None
 
 
-def download_media(url, kind, folder):
+def download_media(url, kind, folder, is_youtube=False):
     output = str(Path(folder) / "media.%(ext)s")
+    skipped = {}
     options = {
         "outtmpl": output,
         "noplaylist": True,
@@ -97,6 +135,18 @@ def download_media(url, kind, folder):
                 "preferredquality": "128",
             }],
         })
+        if is_youtube:
+            def duration_filter(info, *args, **kwargs):
+                duration = info.get("duration")
+                if duration and duration > MAX_YT_AUDIO_SECONDS:
+                    skipped["reason"] = (
+                        "الفيديو أطول من الحد المسموح لاستخراج MP3 من يوتيوب "
+                        f"({MAX_YT_AUDIO_SECONDS // 60} دقيقة)."
+                    )
+                    return "too long"
+                return None
+
+            options["match_filter"] = duration_filter
     else:
         options.update({
             "format": (
@@ -117,6 +167,8 @@ def download_media(url, kind, folder):
         and not p.name.endswith(".part")
     ]
     if not files:
+        if skipped:
+            raise RuntimeError(skipped["reason"])
         raise RuntimeError("لم يُعثر على الملف بعد التنزيل.")
 
     return max(files, key=lambda p: p.stat().st_size)
@@ -185,7 +237,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "اختر من الأزرار أسفل المحادثة:\n"
         "🎬 تنزيل فيديو\n"
         "🎵 تنزيل MP3\n\n"
-        "بعد اختيار الوضع، أرسل رابط الفيديو أو المنشور. "
+        f"{SUPPORT_TEXT}\n\n"
+        "بعد اختيار الوضع، أرسل الرابط. "
         "سيبقى الوضع المختار فعالًا حتى تغيّره.\n\n"
         f"الوضع الحالي: {mode_title(kind)}\n"
         f"🔖 نسخة البوت: {BOT_VERSION}",
@@ -215,27 +268,49 @@ async def handle_link(
             if chosen == "video":
                 await message.reply_text(
                     "🎬 تم اختيار تنزيل الفيديو.\n"
-                    "أرسل رابط الفيديو أو المنشور.",
+                    "أرسل رابط فيديو من إنستغرام أو فيسبوك.\n"
+                    "(يوتيوب متاح في وضع MP3 فقط.)",
                     reply_markup=MAIN_KEYBOARD,
                 )
             else:
                 await message.reply_text(
                     "🎵 تم اختيار استخراج MP3.\n"
-                    "أرسل رابط الفيديو الذي تريد استخراج صوته.",
+                    "أرسل رابط الفيديو الذي تريد استخراج صوته "
+                    "(إنستغرام أو فيسبوك أو يوتيوب).",
                     reply_markup=MAIN_KEYBOARD,
                 )
             return
 
         await message.reply_text(
             "أرسل رابطًا يبدأ بـ https:// أو http://، "
-            "أو اختر نوع التنزيل من الأزرار أسفل المحادثة.",
+            "أو اختر نوع التنزيل من الأزرار أسفل المحادثة.\n\n"
+            f"{SUPPORT_TEXT}",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
     url = match.group(0).rstrip(".,;!?)]}")
     kind = context.user_data.get("kind", "video")
-    log(f"JOB: chat={chat_id} mode={kind}")
+    yt = youtube_kind(url)
+    log(f"JOB: chat={chat_id} mode={kind} youtube={yt or 'no'}")
+
+    # قواعد يوتيوب: MP3 فقط، وبدون قوائم تشغيل
+    if yt == "playlist":
+        await message.reply_text(
+            "قوائم تشغيل يوتيوب غير مدعومة.\n"
+            "أرسل رابط أغنية أو مقطع واحد.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if yt and kind != "audio":
+        await message.reply_text(
+            "🚫 تنزيل فيديوهات يوتيوب غير متاح.\n\n"
+            "يوتيوب مدعوم لاستخراج الصوت فقط. "
+            "اضغط زر 🎵 تنزيل MP3 ثم أعد إرسال الرابط.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
 
     status = await message.reply_text(
         "⏳ بدأت عملية التنزيل. قد يستغرق إنستغرام بعض الوقت...",
@@ -247,7 +322,7 @@ async def handle_link(
             with tempfile.TemporaryDirectory(prefix="media_bot_") as folder:
                 started = time.monotonic()
                 media = await asyncio.to_thread(
-                    download_media, url, kind, folder
+                    download_media, url, kind, folder, bool(yt)
                 )
                 download_seconds = time.monotonic() - started
 
@@ -306,8 +381,8 @@ async def handle_link(
                 log(f"STATUS_ERROR: {edit_error.__class__.__name__}")
 
         except Exception as exc:
-            error = clean_error(exc)
-            log(f"ERROR: mode={kind} {error}")
+            log(f"ERROR: mode={kind} {clean_error(exc)}")
+            error = friendly_error(exc)
 
             # التعديل على رسالة قديمة ما بيحمل لوحة الأزرار،
             # فنحذف رسالة الحالة ونرسل الخطأ كرسالة جديدة مع الأزرار.
